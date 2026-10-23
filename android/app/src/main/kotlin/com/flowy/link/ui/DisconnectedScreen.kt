@@ -42,7 +42,7 @@ private object Copy {
 private val Danger = Color(0xFF8C3A3A)
 
 @Composable
-fun DisconnectedScreen() {
+fun DisconnectedScreen(onConnected: () -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var url by remember { mutableStateOf("") }
@@ -79,7 +79,10 @@ fun DisconnectedScreen() {
                         runCatching { pairWithHost(context, url) }
                     }
                     busy = false
-                    result.onSuccess { status = it.status }
+                    result.onSuccess {
+                        status = it.status
+                        if (it.session.accessToken.isNotBlank()) onConnected()
+                    }
                         .onFailure { error = it.message ?: "连接失败" }
                 }
             },

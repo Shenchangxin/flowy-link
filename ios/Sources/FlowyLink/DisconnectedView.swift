@@ -13,6 +13,7 @@ enum LinkCopy {
 }
 
 struct DisconnectedView: View {
+    var onConnected: () -> Void = {}
     @State private var url = ""
     @State private var error: String?
     @State private var status: String?
@@ -35,6 +36,9 @@ struct DisconnectedView: View {
                     do {
                         let result = try await pairWithHost(rawUrl: url)
                         status = result.status
+                        if result.status.hasPrefix("已连接") {
+                            onConnected()
+                        }
                     } catch {
                         self.error = error.localizedDescription
                     }
