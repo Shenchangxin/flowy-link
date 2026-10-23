@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+      - name: Assemble and test the Android client
+        working-directory: android
+        run: gradle :app:assembleDebug :app:testDebugUnitTest --no-daemon
+
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the Apple client
+        working-directory: ios
+        run: swift test
+
+  harmony-sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Harmony module sources
+        run: node --input-type=module -e "import fs from 'node:fs'; JSON.parse(fs.readFileSync('harmony/entry/src/main/module.json5','utf8')); const page = fs.readFileSync('harmony/entry/src/main/ets/common/Pairing.ets','utf8'); if (!page.includes('flowy://pair?')) process.exit(1);"
