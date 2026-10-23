@@ -18,12 +18,28 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             LinkTheme {
-                var session by remember { mutableStateOf(loadSession(this)) }
+                var session by remember { mutableStateOf(loadSession(this@MainActivity)) }
+                var adding by remember { mutableStateOf(false) }
                 val current = session
-                if (current == null) {
-                    DisconnectedScreen(onConnected = { session = loadSession(this) })
+                if (current == null || adding) {
+                    DisconnectedScreen(
+                        onConnected = {
+                            adding = false
+                            session = loadSession(this@MainActivity)
+                        },
+                        onCancel = if (current != null) {
+                            { adding = false }
+                        } else {
+                            null
+                        },
+                    )
                 } else {
-                    HomeScreen(current, onDisconnect = { session = null })
+                    HomeScreen(
+                        current,
+                        onDisconnect = { session = loadSession(this@MainActivity) },
+                        onAddComputer = { adding = true },
+                        onSwitch = { session = it },
+                    )
                 }
             }
         }

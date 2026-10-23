@@ -103,7 +103,7 @@ fun pairWithHost(context: Context, rawUrl: String): PairResult {
     throw lastError ?: IllegalStateException("没有可连接的地址")
 }
 
-private fun pinnedClient(expectedFingerprint: String): OkHttpClient {
+internal fun pinnedClient(expectedFingerprint: String): OkHttpClient {
     val trust = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
 
@@ -137,12 +137,62 @@ private fun deviceFingerprint(context: Context): String {
     return fingerprint
 }
 
-private const val SESSION_KEY = "session"
-private const val CACHE_KEY = "conversation-cache"
+private const val HOSTS_KEY = "hosts"
+private const val ACTIVE_KEY = "active"
+private const val LEGACY_SESSION_KEY = "session"
+
+fun loadHosts(context: Context): List<HostSession> = storedHosts(context)
 
 fun loadSession(context: Context): HostSession? {
-    val raw = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).getString(SESSION_KEY, null) ?: return null
-    val json = JSONObject(raw)
+    val hosts = storedHosts(context)
+    val active = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).getString(ACTIVE_KEY, null)
+    return hosts.firstOrNull { it.fingerprint == active } ?: hosts.firstOrNull()
+}
+
+fun saveSession(context: Context, session: HostSession) {
+    val hosts = storedHosts(context).filter { it.fingerprint != session.fingerprint } + session
+    writeHosts(context, hosts, session.fingerprint)
+}
+
+fun activateHost(context: Context, fingerprint: String) {
+    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).edit().putString(ACTIVE_KEY, fingerprint).apply()
+    LinkWidget.refresh(context)
+}
+
+fun clearSession(context: Context) {
+    val prefs = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+    val active = prefs.getString(ACTIVE_KEY, null) ?: loadSession(context)?.fingerprint
+    val hosts = storedHosts(context).filter { it.fingerprint != active }
+    writeHosts(context, hosts, hosts.firstOrNull()?.fingerprint)
+}
+
+private fun storedHosts(context: Context): List<HostSession> {
+    val prefs = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+    val raw = prefs.getString(HOSTS_KEY, null)
+    if (raw != null) {
+        val array = org.json.JSONArray(raw)
+        return List(array.length()) { decodeSession(array.getJSONObject(it)) }.filterNotNull()
+    }
+    return listOfNotNull(decodeSession(prefs.getString(LEGACY_SESSION_KEY, null)))
+}
+
+private fun writeHosts(context: Context, hosts: List<HostSession>, active: String?) {
+    val array = org.json.JSONArray()
+    hosts.forEach { array.put(encodeSession(it)) }
+    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).edit()
+        .putString(HOSTS_KEY, array.toString())
+        .putString(ACTIVE_KEY, active)
+        .remove(LEGACY_SESSION_KEY)
+        .apply()
+    LinkWidget.refresh(context)
+}
+
+private fun decodeSession(raw: Any?): HostSession? {
+    val json = when (raw) {
+        is String -> JSONObject(raw)
+        is JSONObject -> raw
+        else -> return null
+    }
     val addresses = json.optJSONArray("addresses") ?: return null
     return HostSession(
         json.optString("name"),
@@ -156,10 +206,10 @@ fun loadSession(context: Context): HostSession? {
     )
 }
 
-fun saveSession(context: Context, session: HostSession) {
+private fun encodeSession(session: HostSession): JSONObject {
     val addresses = org.json.JSONArray()
     session.addresses.forEach { addresses.put(it) }
-    val json = JSONObject()
+    return JSONObject()
         .put("name", session.name)
         .put("fingerprint", session.fingerprint)
         .put("port", session.port)
@@ -168,17 +218,50 @@ fun saveSession(context: Context, session: HostSession) {
         .put("refreshToken", session.refreshToken)
         .put("deviceId", session.deviceId)
         .put("wakeEnabled", session.wakeEnabled)
-    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).edit().putString(SESSION_KEY, json.toString()).apply()
 }
 
-fun clearSession(context: Context) {
-    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).edit().remove(SESSION_KEY).apply()
-}
+fun conversationCacheKey(fingerprint: String) = "conversation-cache-$fingerprint"
 
-fun cachedConversations(context: Context): List<String> {
-    val raw = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).getString(CACHE_KEY, null) ?: return emptyList()
+fun cachedConversations(context: Context, fingerprint: String): List<Pair<String, String>> {
+    val raw = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+        .getString(conversationCacheKey(fingerprint), null) ?: return emptyList()
     val array = org.json.JSONArray(raw)
-    return List(array.length()) { array.getString(it) }
+    return List(array.length()) { index ->
+        val item = array.optJSONObject(index) ?: return@List "" to array.optString(index)
+        item.optString("id") to item.optString("name")
+    }.filter { it.second.isNotBlank() }
+}
+
+fun cacheConversations(context: Context, fingerprint: String, rows: List<Pair<String, String>>) {
+    val array = org.json.JSONArray()
+    rows.forEach { (id, name) -> array.put(JSONObject().put("id", id).put("name", name)) }
+    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+        .edit().putString(conversationCacheKey(fingerprint), array.toString()).apply()
+}
+
+fun loadLastConversation(context: Context, fingerprint: String): String? {
+    return context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+        .getString("last-conversation-$fingerprint", null)?.ifBlank { null }
+}
+
+fun saveLastConversation(context: Context, fingerprint: String, conversationId: String?) {
+    val edit = context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE).edit()
+    if (conversationId.isNullOrBlank()) edit.remove("last-conversation-$fingerprint") else edit.putString("last-conversation-$fingerprint", conversationId)
+    edit.apply()
+}
+
+fun loadDraft(context: Context, fingerprint: String, conversationId: String): String {
+    return context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+        .getString("draft-$fingerprint-$conversationId", "").orEmpty()
+}
+
+fun saveDraft(context: Context, fingerprint: String, conversationId: String, draft: String) {
+    context.getSharedPreferences("flowy-link", Context.MODE_PRIVATE)
+        .edit().putString("draft-$fingerprint-$conversationId", draft).apply()
+}
+
+object LinkWait {
+    var show: ((String?) -> Unit)? = null
 }
 
 fun callHost(context: Context, session: HostSession, method: String, path: String, body: String? = null): String {
@@ -196,7 +279,13 @@ fun callHost(context: Context, session: HostSession, method: String, path: Strin
             val text = response.use { result ->
                 val payload = result.body?.string().orEmpty()
                 if (result.code == 403 && payload.contains("link step-up")) {
-                    val grant = requestDesktopConfirm(client, address, current, method, path)
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    handler.post { LinkWait.show?.invoke("请在电脑上允许这次操作") }
+                    val grant = try {
+                        requestDesktopConfirm(client, address, current, method, path)
+                    } finally {
+                        handler.post { LinkWait.show?.invoke(null) }
+                    }
                     val retried = send(client, address, current.port, current.accessToken, method, path, body, grant)
                     retried.use { second ->
                         val confirmed = second.body?.string().orEmpty()

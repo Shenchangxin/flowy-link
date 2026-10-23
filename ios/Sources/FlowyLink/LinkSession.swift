@@ -18,30 +18,93 @@ struct HostSession: Codable {
     var wakeEnabled: Bool
 }
 
-private let sessionKey = "flowy-link.session"
+private let hostsKey = "flowy-link.hosts"
+private let activeKey = "flowy-link.active"
+private let legacySessionKey = "flowy-link.session"
 private let cacheKey = "flowy-link.conversations"
 
+func loadHosts() -> [HostSession] {
+    let defaults = UserDefaults.standard
+    if let data = defaults.data(forKey: hostsKey),
+       let hosts = try? JSONDecoder().decode([HostSession].self, from: data) {
+        return hosts
+    }
+    guard let legacy = defaults.data(forKey: legacySessionKey),
+          let session = try? JSONDecoder().decode(HostSession.self, from: legacy) else {
+        return []
+    }
+    return [session]
+}
+
 func loadSession() -> HostSession? {
-    guard let data = UserDefaults.standard.data(forKey: sessionKey) else { return nil }
-    return try? JSONDecoder().decode(HostSession.self, from: data)
+    let hosts = loadHosts()
+    let active = UserDefaults.standard.string(forKey: activeKey)
+    return hosts.first { $0.fingerprint == active } ?? hosts.first
 }
 
 func saveSession(_ session: HostSession) {
-    if let data = try? JSONEncoder().encode(session) {
-        UserDefaults.standard.set(data, forKey: sessionKey)
+    var hosts = loadHosts().filter { $0.fingerprint != session.fingerprint }
+    hosts.append(session)
+    if let data = try? JSONEncoder().encode(hosts) {
+        UserDefaults.standard.set(data, forKey: hostsKey)
     }
+    UserDefaults.standard.set(session.fingerprint, forKey: activeKey)
+    UserDefaults.standard.removeObject(forKey: legacySessionKey)
+}
+
+func activateHost(_ fingerprint: String) {
+    UserDefaults.standard.set(fingerprint, forKey: activeKey)
 }
 
 func clearSession() {
-    UserDefaults.standard.removeObject(forKey: sessionKey)
+    let active = UserDefaults.standard.string(forKey: activeKey) ?? loadSession()?.fingerprint
+    let hosts = loadHosts().filter { $0.fingerprint != active }
+    if let data = try? JSONEncoder().encode(hosts) {
+        UserDefaults.standard.set(data, forKey: hostsKey)
+    }
+    UserDefaults.standard.set(hosts.first?.fingerprint, forKey: activeKey)
 }
 
-func cachedConversationNames() -> [String] {
-    UserDefaults.standard.stringArray(forKey: cacheKey) ?? []
+func cachedConversations(_ fingerprint: String) -> [(String, String)] {
+    guard let data = UserDefaults.standard.data(forKey: "\(cacheKey).\(fingerprint)"),
+          let rows = try? JSONDecoder().decode([[String]].self, from: data) else { return [] }
+    return rows.compactMap { pair in
+        guard pair.count == 2, !pair[0].isEmpty else { return nil }
+        return (pair[0], pair[1])
+    }
 }
 
-func cacheConversationNames(_ names: [String]) {
-    UserDefaults.standard.set(names, forKey: cacheKey)
+func cacheConversations(_ fingerprint: String, _ rows: [(String, String)]) {
+    let encoded = rows.map { [$0.0, $0.1] }
+    if let data = try? JSONEncoder().encode(encoded) {
+        UserDefaults.standard.set(data, forKey: "\(cacheKey).\(fingerprint)")
+    }
+}
+
+func loadLastConversation(_ fingerprint: String) -> String? {
+    UserDefaults.standard.string(forKey: "flowy-link.last.\(fingerprint)")
+}
+
+func saveLastConversation(_ fingerprint: String, _ conversationId: String?) {
+    let key = "flowy-link.last.\(fingerprint)"
+    if let conversationId, !conversationId.isEmpty {
+        UserDefaults.standard.set(conversationId, forKey: key)
+    } else {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+func loadDraft(_ fingerprint: String, _ conversationId: String) -> String {
+    UserDefaults.standard.string(forKey: "flowy-link.draft.\(fingerprint).\(conversationId)") ?? ""
+}
+
+func saveDraft(_ fingerprint: String, _ conversationId: String, _ draft: String) {
+    UserDefaults.standard.set(draft, forKey: "flowy-link.draft.\(fingerprint).\(conversationId)")
+}
+
+@MainActor
+enum LinkWait {
+    static var show: ((String?) -> Void)?
 }
 
 func callHost(_ session: HostSession, method: String, path: String, body: Data? = nil) async throws -> (HostSession, Data) {
@@ -56,7 +119,15 @@ func callHost(_ session: HostSession, method: String, path: String, body: Data? 
                 response = try await client.send(session: current, address: address, method: method, path: path, body: body, stepUp: nil)
             }
             if response.status == 403, let text = String(data: response.data, encoding: .utf8), text.contains("link step-up") {
-                let grant = try await client.confirm(session: current, address: address, method: method, path: path)
+                await MainActor.run { LinkWait.show?("请在电脑上允许这次操作") }
+                let grant: String
+                do {
+                    grant = try await client.confirm(session: current, address: address, method: method, path: path)
+                } catch {
+                    await MainActor.run { LinkWait.show?(nil) }
+                    throw error
+                }
+                await MainActor.run { LinkWait.show?(nil) }
                 response = try await client.send(session: current, address: address, method: method, path: path, body: body, stepUp: grant)
             }
             guard (200..<300).contains(response.status) else {
@@ -104,7 +175,7 @@ func pairWithHost(rawUrl: String) async throws -> PairResult {
     throw lastError
 }
 
-private final class PinnedSession: NSObject, URLSessionDelegate {
+final class PinnedSession: NSObject, URLSessionDelegate {
     let expected: String
     private lazy var session: URLSession = {
         URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
@@ -232,6 +303,10 @@ private final class PinnedSession: NSObject, URLSessionDelegate {
             }
         }
         throw LinkSessionError.message("等待电脑确认超时")
+    }
+
+    func socket(for request: URLRequest) -> URLSessionWebSocketTask {
+        session.webSocketTask(with: request)
     }
 
     func urlSession(
